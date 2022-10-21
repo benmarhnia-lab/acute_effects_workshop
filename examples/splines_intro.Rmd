@@ -1,0 +1,133 @@
+---
+title: "Splines"
+author: "Chen Chen"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(splines)
+library(Hmisc)
+```
+
+This document was written based on Chapter 7 of "An introduction to statistical learning with applications in R" by Gareth James, Daniela Witten, Trevor Hastie, and Robert Tibshirani, with DOI 10.1007/978-1-4614-7138-7. Other related papers were cited in the document.    
+
+## Background
+Splines are utilized when the data demonstrate patterns beyond linear. Here, we are focusing on parametric regression splines, while other methods exist for modeling non-linear patterns, such as local regressions (e.g., nonparametric k-nearest neighbor regression through *knn* function in libarary "KNN", and locally weighted scatter plot smoothing realized through *lowess* function in R "stats" package), penalized splines (semiparimetric spline realized through *spm* function in "SemiPar" package), and generalized additive model (nonparametric smoothing spline realized through *gam* function in "GAM" package).  
+
+## Parametric splines
+Parametric regression spline is an extension of step functions and polynomial regressions. Step functions cut the range of a variable into several distinct regions. Polynomial regression extends the linear model by adding extra predictors such as quadratic terms $x^2$ and cubic terms $x^3$ to provide a non-linear fit. For parametric regression splines, within each region, a polynomial function is fit to the data, with or without constrains.  
+
+To demonstrate different types of splines, I utilized a dataset (bone.csv) included in the Elements of Statistical Learning textbook as an example. I modeled bone mineral density trajectories (*spnbmd* variable in data, difference in spinal bone mineral density measurements taken on two consecutive visits, divided by the average) over age for females and males using different regression splines. I also ignored the fact that these are longitudinal data measured repetitively among the same group of individuals (ignore the *idnum* variable in data). I also set two internal knots (the points where the coefficients change) at 33rd and 67th percentiles (arbitrary decision) of age for the entire population.    
+
+```{r}
+bone <- read.csv("../data/bone.csv", as.is = TRUE)
+head(bone)
+bds <- quantile(bone$age, probs=c(0, 1/3, 2/3, 1))
+bone$agecat <- cut(bone$age, breaks=bds, include.lowest=TRUE)
+
+plot(bone$age, bone$spnbmd, col=as.factor(bone$gender), pch=16, xlab="Average age over two visits", ylab="Reletive bone density", main="Data inspection")
+abline(v=bds, lwd=2, lty=3, col="blue")
+legend("topright", legend=as.factor(unique(bone$gender)), pch=c(16, 16),
+        col=as.factor(unique(bone$gender)))
+
+```
+
+#### Function for plot
+```{r}
+hw6.plot <- function(m.info, m.name, dat, knot) {
+  plot(dat$age, dat$spnbmd, col=as.factor(dat$gender), pch=16, 
+     xlab="Average age over two visits", ylab="Reletive bone density", 
+     main=m.name, cex=0.5)
+  legend("topright", legend=as.factor(unique(dat$gender)), pch=c(16, 16),
+         lty=c(1,1),col=as.factor(unique(dat$gender)))
+  abline(v=knot, lwd=2, lty=3, col="blue") # locations of knots
+  curve(predict(m.info, data.frame(agecat=cut(x, breaks=knot, include.lowest=TRUE), age=x, gender="female")), lwd=3, col=1, add=TRUE) #estimates for male
+  curve(predict(m.info, data.frame(agecat=cut(x, breaks=knot, include.lowest=TRUE), age=x, gender="female"), interval="confidence")[,2], lwd=1, col=1, lty=2, add=TRUE) #lower confidence interval
+  curve(predict(m.info, data.frame(agecat=cut(x, breaks=knot, include.lowest=TRUE), age=x, gender="female"), interval="confidence")[,3], lwd=1, col=1, lty=2, add=TRUE) #upper confidence interval
+  curve(predict(m.info, data.frame(agecat=cut(x, breaks=knot, include.lowest=TRUE),
+                                       age=x, gender="male")), 
+        lwd=3, col=2, add=TRUE)
+  curve(predict(m.info, data.frame(agecat=cut(x, breaks=knot, include.lowest=TRUE),
+                                       age=x, gender="male"), 
+                interval="confidence")[,2], lwd=1, col=2, lty=2, add=TRUE)
+  curve(predict(m.info, data.frame(agecat=cut(x, breaks=knot, include.lowest=TRUE),
+                                       age=x, gender="male"), 
+                interval="confidence")[,3], lwd=1, col=2, lty=2, add=TRUE)
+}
+```
+
+### Linear model with step functions
+Step functions could be viewed as breaking the range of variable into bins and fit a different model in each bin, which is equivalent to converting a continuous variable into an ordered categorical variable. In the example below, I broke *age* into three bins and fit a linear function for each bin separately, which resulted in jumps at knot boundaries (discussed and tackled later).   
+The model could be expressed as $y_i = \beta_0 + \beta_1age_i + \beta_2I(age_i\ge\xi_1) + \beta_3age_iI(age_i\ge\xi_1) + \beta_4I(age_i\ge\xi_2) + \beta_5age_iI(age_i\ge\xi_2) + \epsilon_i$, where $I(age_i\ge\xi_1)$ is equal to 1 when $age_i\ge\xi_1$ and 0 otherwise. This model estimated 3 bins * 2 terms per bin = 6 coefficients for each gender group.   
+```{r}
+m0 <- lm(spnbmd ~ agecat*age*gender, data=bone)
+length(coef(m0)) # number of coefficients fitted for the whole model
+length(coef(m0))/2 # number of coefficients fitted for one gender only model
+hw6.plot(m0, "Step function model", bone, bds)
+```
+
+### Piecewise quadratic model
+We could also fit a more complicated function within each bin. Below I broke *age* into three bins and fit a quadratic function for each bin separately. Notice that I have not placed any constrain on continuity or boundary conditions. The model could be expressed as $y_i = \beta_0 + \beta_1age_i + \beta_2age_i^2 + \beta_3I(age_i\ge\xi_1) + \beta_4age_iI(age_i\ge\xi_1) + \beta_5age_i^2I(age_i\ge\xi_1) + \beta_6I(age_i\ge\xi_2) + \beta_7age_iI(age_i\ge\xi_2) + \beta_8age_i^2I(age_i\ge\xi_2) + \epsilon_i$. This model estimated 3 bins * 3 terms per bin = 9 coefficients for each gender group.    
+```{r}
+m1 <- lm(spnbmd ~ (agecat*poly(age, 2, raw=T))*gender, data=bone)
+length(coef(m1)) # number of coefficients fitted for the whole model
+length(coef(m1))/2 # number of coefficients fitted for one gender only model
+hw6.plot(m1, "Piecewise quadratic model", bone, bds)
+```
+
+### Continuous piecewise quadratic model
+To avoid the jump between bins, we normally would impose continuity constraint at the knot by removing the intercept coefficient for bins other than the first one. The model could be expressed as $y_i = \beta_0 + \beta_1age_i + \beta_2age_i^2 + \beta_3(age_i-\xi_1)I(age_i\ge\xi_1) + \beta_4(age_i-\xi_1)^2I(age_i\ge\xi_1) + \beta_5(age_i-\xi_2)I(age_i\ge\xi_2) + \beta_6(age_i-\xi_2)^2I(age_i\ge\xi_2) + \epsilon_i$. This model estimated 1 intercept + 3 bins * 2 terms per bin = 7 coefficients for each gender group.   
+```{r}
+m2 <- lm(spnbmd ~ (poly(age, 2, raw=T) + poly(pmax(I(age-bds[2]),0), 2, raw=T) 
+          + poly(pmax(I(age-bds[3]),0), 2, raw=T))*gender, data=bone)
+length(coef(m2)) # number of coefficients fitted for the whole model
+length(coef(m2))/2 # number of coefficients fitted for one gender only model
+hw6.plot(m2, "Continuous piecewise quadratic model", bone, bds)
+```
+
+### Cubic spline model
+We could also make the transition at knots more smoothly by requiring continuity in higher derivatives at the knot. When we apply cubic function for each bin and impose continuity at knots and in first and second derivatives at knots, we get the cubic spline model. The model could be expressed as $y_i = \beta_0 + \beta_1age_i + \beta_2age_i^2 + \beta_3age_i^3 + \beta_4(age_i-\xi_1)^3I(age_i\ge\xi_1) + \beta_5(age_i-\xi_2)^3I(age_i\ge\xi_2) + \epsilon_i$. This model estimated 1 bin * 4 terms per bin (intercept + 3 cubic terms) + 2 bins * 1 terms per bin = 6 coefficients for each gender group.  
+```{r}
+m4 <- lm(spnbmd ~ (poly(age, 3, raw=T) + I(pmax(age-bds[2],0)^3) + 
+                       I(pmax(age-bds[3],0)^3))*gender, data=bone)
+length(coef(m4)) # number of coefficients fitted for the whole model
+length(coef(m4))/2 # number of coefficients fitted for one gender only model
+hw6.plot(m4, "Cubic spline model", bone, bds)
+```
+
+Another way of representing the cubic spline function is by using a series of **b-spline functions**, which can be realized using *bs* function in "splines" package. The results of using b-spline functions and a combination of cubic polynomial functions and truncated power basis functions are the same. *bs* requires specification of internal knots or degree of freedom=# of internal knots + degree of piecewise polynomial (default to 3, cubic splines) without intercept within the basis functions (5). Although we did not include an intercept for the basis functions, the linear model automatically added an intercept, thus making the total coefficients estimated for each gender equal to 6. If we want to provide df instead of actual internal knots, we should use df=5 in the example below. The degree of freedom is also equal to the number of coefficients estimated.   
+Basis functions (*ns*, *bs*) in R set the default to exclude intercept because inclusion of intercept could lead to perfect multicollinearity in a regression setting (sum of all basis functions at each value is equal to 1).       
+```{r}
+m4_2 <- lm(spnbmd ~ bs(age, knots=bds[2:3])*gender, data=bone)
+length(coef(m4_2)) # number of coefficients fitted for the whole model
+length(coef(m4_2))/2 # number of coefficients fitted for one gender only model
+hw6.plot(m4_2, "Cubic spline model-bs", bone, bds)
+```
+
+### Natural cubic spline model
+Splines can have high variance at the outer boundary and a natural spline has additional boundary constrains: the function is required to be linear at the boundary knots, which generally produce more stable estimates at the boundaries. This could be realized with *ns* function in "splines" package. Similar to *bs*, *ns*  requires specification of internal knots or degree of freedom=# of internal knots + 1 without intercept within the basis functions (3). The linear model added an intercept for the whole model and made the # of coefficients estimated equal to 4 for each gender group.       
+```{r}
+m5 <- lm(spnbmd ~ ns(age, knots=bds[2:3])*gender, data=bone)
+length(coef(m5)) # number of coefficients fitted for the whole model
+length(coef(m5))/2 # number of coefficients fitted for one gender only model
+hw6.plot(m5, "Natural cubic spline model", bone, bds)
+```
+
+### Restricted cubic spline
+Restricted cubic spline is a cubic regression spline constrained to have continuous first and second derivatives at the knots, and is constrained to be linear above the last knot and below the first. It is the piecewise polynomials version of natural cubic spline. It requires specification of knots that includes the boundary. The default selection of knot location is different from *ns* if knot locations are not provided.     
+```{r}
+m6 <- lm(spnbmd ~ rcspline.eval(age, knots=bds, inclx = TRUE)*gender, data=bone)
+length(coef(m6)) # number of coefficients fitted for the whole model
+length(coef(m6))/2 # number of coefficients fitted for one gender only model
+hw6.plot(m6, "Restricted cubic spline model", bone, bds)
+```
+
+## Selection of degree of freedom or locations of knots
+One option is to place more knots in places where we feel the function might vary most rapidly, and to place fewer knots where it seems more stable. While this option can work well, in practice it is common to place knots in a uniform fashion. One way to do this is to specify the desired degrees of freedom, and then have the software automatically place the corresponding number of knots at uniform quantiles of the data. Another option is to try out different number of knots and see which produces the best looking curve or use cross-validation.  
+Instead of fixing the number and location of knots to be considered as in natural cubic spline, knot placement in penalized splines and smoothing splines are more data-driven by placing knots at more locations than actually needed and shrinking the coefficients through a penalty term that penalizes the variability in the smoothing function.(James et al. 2013 pp. 277–280) However, previous simulation study found that both fully parametric and nonparametric methods perform well, with neither preferred.(Peng et al. 2006)  
+
+## Citations
+James G, Witten D, Hastie T, Tibshirani R. 2013. An Introduction to Statistical Learning: with Applications in R. Springer-Verlag:New York.  
+Peng RD, Dominici F, Louis TA. 2006. Model choice in time series studies of air pollution and mortality. J R Stat Soc Ser A Stat Soc 169:179–203; doi:10.1111/j.1467-985X.2006.00410.x.  
