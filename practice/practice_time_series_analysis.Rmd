@@ -1,0 +1,165 @@
+---
+title: "Practice time series analysis"
+author: "Chen Chen"
+output: html_document
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This is the answer key for the practice of the acute effect workshop. In this analysis, we aim to estimate the acute effect of heatwave on the daily all-cause hospitalization in three municipals of Mexico from 2008 to 2018 in summer months (May to October). Specifically, we expect to answer the following steps:  
+1. What is the rate ratio of hospitalization during heatwave days compared to non-heatwave days for each municipality? Run a quasi-Poinson model to study the association between daily hospitalization (*all_hosp*) and same day heatwave (*hw*) for each municipality (*adm2_es*). Hint: use four degree of freedom per year in natural cubic spline function of time to account for long-term and seasonal trend. Since we don't have access to the population at risk, what assumption are we making to make this inference?  
+2. What is the regional same day effect of heatwave on risk of hospitalization across all municipality? Hint: pooled effect  
+3. What is the rate ratio of hospitalization during the next day of a heatwave day compared to other days for each municipality and for the region? Hint: lagged exposure.  
+
+```{r, message=FALSE, warning=FALSE}
+library(data.table) ## for easy handling of data
+library(splines) ## for "ns" function of cubic splines
+# remotes::install_github("rdpeng/tlnise") ## installation of tlnise package. There are other packages that conducts Bayesian hierarchical model as well (BUGS).
+# library(tlnise) ## for Bayesian hierarchical model pooling
+library(mvmeta) ## for random-effect meta-regression pooling
+```
+
+
+## Dataset preparation
+Here we restricted analysis to summer months and looked at the number of events for each month and municipality. The number for Tecate is relatively low as well (24 days with some visits). Low number of day with cases might cause the Poisson model to fail to converge. In a real study, I might consider aggregate these municipals with nearby areas to increase the number of days with cases or simply drop these municipals given their relatively low population.
+```{r}
+dt <- fread("../data/BC_hosp_temp_08_18_clean.csv")
+print(rbind(head(dt), tail(dt))) #preliminary look at data
+table(dt$adm2_es)
+
+## quick look at distribution of heatwaves by month--total of ~30*6=180 days per month
+dt$month <- month(dt$date)
+dt$year <- year(dt$date)
+dt$dayofyear <- yday(dt$date)
+dt[, sum(hw), by = .(month, adm2_es)]
+dt[, quantile(max_temp_era5, probs = c(0.9)), by = adm2_es] #threshold values by municipal
+
+## order the data by date for lagging exposure and creation of time variable later
+dt <- dt[order(dt$date), ]
+
+## create heatwave index with one day lag
+dt[, hw_lag1 := shift(hw, n = 1, fill = NA, type = "lag"), by = adm2_es]
+
+## create new time variable & day of week
+dt$day <- rep(seq(1:length(unique(dt$date))), each=3)
+dt$dow <- as.factor(weekdays(dt$date))
+
+## look at relevant data
+print(rbind(head(dt), tail(dt)))
+# xtabs(~all_hosp + hw + adm2_es, data=dt)
+```
+
+## Association between emergency visits and same day heatwave
+### Quasi-Poisson model for each municipal
+There are two schools of adjustment for long-term and seasonal trend when only a subset of months were included in time-series analysis: 1) using a natural cubic spline function with fewer degree of freedom per year (normally 2df/yr when using 4 months of data);  2) using a natural cubic spline function of year and interaction terms between the natural cubic spline function of year with 1-2df and a natural cubic spline function of day of the year with 2df. Conceptually they are similar and I included codes for both.     
+Since we don't have access to population at risk, we assumed that the population at risk do not change dramatically during the years in study. Even if it does, the adjustment for long-term trend should have adjusted for it. Including the offset term is more of a conceptual need.  
+```{r}
+nyr <- 11 # number of years from 2008 to 2018
+ndf <- 4 # degree of freedom per year--based on literature
+foo <- numeric()
+for (mun in unique(dt$adm2_es)) {
+  f <- tryCatch({ ## the tryCatch function will keep the loop going even when error occurs--useful when running a big loop
+    glm(all_hosp ~ dow + hw + ns(day, df = nyr * ndf), data=dt[dt$adm2_es==mun, ], family = quasipoisson)
+    # glm(all_hosp ~ dow + hw + ns(year, df=1) + ns(year, df=1):ns(dayofyear, df = ndf), data=dt[dt$adm2_es==mun, ], family = quasipoisson)
+    }, condition = function(cond) {
+              cat("\t", mun, as.character(cond))
+              cond$call <- NULL
+              cond
+            })
+  if (!inherits(f, what = "condition")) {
+      rval <- data.frame(municipal = mun, beta = summary(f)$coefficients["hw", 1], se = summary(f)$coefficients["hw", 2], dispersion = summary(f)$dispersion)
+      foo <- rbind(foo, rval)
+  }
+}
+foo$est <- exp(foo$beta)
+foo$ll <- exp(foo$beta - 1.96 * foo$se)
+foo$ul <- exp(foo$beta + 1.96 * foo$se)
+print(cbind(foo$municipal, round(foo[, c("est", "ll", "ul")], digits=3)))
+```
+
+### Aggregate results across municipals
+Here we aggregated the results across three municipals using both the *tlnise* package and the *mvmeta* package. The former employs a Bayesian hierarchical model with normal approximation for estimates from Poisson model. The latter employs meta regression with random intercept for each municipal. Both method could incorporate consideration of effect modification (*w* in tlnise and add variables for formula in meta).  
+```{r}
+### meta-regression
+out.m1 <- mvmeta(foo$beta, S = (foo$se)^2, method="reml")
+temp <- round(c(exp(coef(out.m1)), exp(coef(out.m1) - 1.96*sqrt(vcov(out.m1))),  exp(coef(out.m1) + 1.96*sqrt(vcov(out.m1)))), digits=3)
+names(temp) <- c("Estimation", "Lower limit for 95% CI", "Upper limit for 95% CI")
+print(temp)
+```
+
+```{r, eval=FALSE}
+## Bayesian hierarchical model
+out <- tlnise(Y = foo$beta, V = (foo$se)^2, w = rep(1, nrow(foo)), seed=1234, maxiter = 5000, prnt = FALSE)
+## Estimate and 95% CI of regional mean using posterior mean and SD for stage-two gamma
+temp <- round(c(exp(out$gamma[, "est"]), exp(out$gamma[, "est"] - 1.96*out$gamma[, "se"]), exp(out$gamma[, "est"] + 1.96*out$gamma[, "se"])), digits=3)
+names(temp) <- c("Estimation", "Lower limit for 95% CI", "Upper limit for 95% CI")
+print(temp)
+
+## below I estimated the 95% CI using random pulls from the posterior distribution
+## this is useful when more complicated transformations are needed
+gs <- tlnise:::sampleGamma(out, V = (foo$se)^2, Y = foo$beta) ## generate samples of gammastar, Dstar from equation (14) of Everson & Morris
+sampsGamma <- tlnise:::drawSample0(gs, n=10000)
+## Estimate and 95% CI of regional mean using random pulls from posterior distribution
+temp <- round(c(exp(mean(sampsGamma)), exp(quantile(sampsGamma, probs = c(0.025, 0.975)))), digits=3)
+names(temp) <- c("Estimation", "Lower limit for 95% CI", "Upper limit for 95% CI")
+print(temp)
+```
+
+
+
+
+## Association between emergency visits and previous day heatwave
+Exploring the effect of heatwave from the previous day without considering the duration of the heatwave is a little absurd. Updating the heatwave to incorporate consideration of heatwave duration might be more reasonable. For the demonstration of single lagged effect, we ran the analysis below and found similar results as those from same day association.  
+```{r}
+nyr <- 11 # number of years from 2008 to 2018
+ndf <- 4 # degree of freedom per year--based on literature
+foo2 <- numeric()
+for (mun in unique(dt$adm2_es)) {
+  f <- tryCatch({
+    glm(all_hosp ~ dow + hw_lag1 + ns(day, df = nyr * ndf), data=dt[dt$adm2_es==mun, ], family = quasipoisson)
+    }, condition = function(cond) {
+              cat("\t", mun, as.character(cond))
+              cond$call <- NULL
+              cond
+            })
+  if (!inherits(f, what = "condition")) {
+      rval <- data.frame(municipal = mun, beta = summary(f)$coefficients["hw_lag1", 1], se = summary(f)$coefficients["hw_lag1", 2], dispersion = summary(f)$dispersion)
+      foo2 <- rbind(foo2, rval)
+  }
+}
+foo2$est <- exp(foo2$beta)
+foo2$ll <- exp(foo2$beta - 1.96 * foo2$se)
+foo2$ul <- exp(foo2$beta + 1.96 * foo2$se)
+print(cbind(foo2$municipal, round(foo2[, c("est", "ll", "ul")], digits=3)))
+```
+
+```{r}
+### meta-regression
+out.m2 <- mvmeta(foo2$beta, S = (foo2$se)^2, method="reml")
+temp <- round(c(exp(coef(out.m2)), exp(coef(out.m2) - 1.96*sqrt(vcov(out.m2))),  exp(coef(out.m2) + 1.96*sqrt(vcov(out.m2)))), digits=3)
+names(temp) <- c("Estimation", "Lower limit for 95% CI", "Upper limit for 95% CI")
+print(temp)
+```
+
+```{r, eval=FALSE}
+## Bayesian hierarchical model
+out2 <- tlnise(Y = foo2$beta, V = (foo2$se)^2, w = rep(1, nrow(foo2)), seed=1234, maxiter = 5000, prnt = FALSE)
+## Estimate and 95% CI of regional mean using posterior mean and SD for stage-two gamma
+temp <- round(c(exp(out2$gamma[, "est"]), exp(out2$gamma[, "est"] - 1.96*out2$gamma[, "se"]), exp(out2$gamma[, "est"] + 1.96*out2$gamma[, "se"])), digits=3)
+names(temp) <- c("Estimation", "Lower limit for 95% CI", "Upper limit for 95% CI")
+print(temp)
+
+## below I estimated the 95% CI using random pulls from the posterior distribution
+## this is useful when more complicated transformations are needed
+gs2 <- tlnise:::sampleGamma(out2, V = (foo2$se)^2, Y = foo2$beta) ## generate samples of gammastar, Dstar from equation (14) of Everson & Morris
+sampsGamma2 <- tlnise:::drawSample0(gs2, n=10000)
+## Estimate and 95% CI of regional mean using random pulls from posterior distribution
+temp <- round(c(exp(mean(sampsGamma2)), exp(quantile(sampsGamma2, probs = c(0.025, 0.975)))), digits=3)
+names(temp) <- c("Estimation", "Lower limit for 95% CI", "Upper limit for 95% CI")
+print(temp)
+```
+
+
